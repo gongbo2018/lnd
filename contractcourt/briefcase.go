@@ -10,6 +10,7 @@ import (
 	"github.com/btcsuite/btcd/wire"
 	"github.com/coreos/bbolt"
 	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/lnwallet"
 )
 
@@ -81,15 +82,22 @@ type ArbitratorLog interface {
 	// contract resolutions from persistent storage.
 	FetchContractResolutions() (*ContractResolutions, error)
 
-	// LogChainActions stores a set of chain actions which are derived from
-	// our set of active contracts, and the on-chain state. We'll write
-	// this et of cations when: we decide to go on-chain to resolve a
-	// contract, or we detect that the remote party has gone on-chain.
-	LogChainActions(ChainActionMap) error
+	// InsertConfirmedCommitSet stores the known set of active HTLCs at the
+	// time channel closure. We'll use this to reconstruct our set of chain
+	// actions anew based on the confirmed and pending commitment state.
+	InsertConfirmedCommitSet(c *CommitSet) error
+
+	// FetchConfirmedCommitSet fetches the known confirmed active HTLC set
+	// from the database.
+	FetchConfirmedCommitSet() (*CommitSet, error)
 
 	// FetchChainActions attempts to fetch the set of previously stored
 	// chain actions. We'll use this upon restart to properly advance our
 	// state machine forward.
+	//
+	// NOTE: This method only exists in order to be able to serve nodes had
+	// channels in the process of closing before the CommitSet struct was
+	// introduced.
 	FetchChainActions() (ChainActionMap, error)
 
 	// WipeHistory is to be called ONLY once *all* contracts have been
@@ -258,6 +266,11 @@ var (
 	// actionsBucketKey is the key under the logScope that we'll use to
 	// store all chain actions once they're determined.
 	actionsBucketKey = []byte("chain-actions")
+
+	// commitSetKey is the primary key under the logScope that we'll use to
+	// store the confirmed active HTLC sets once we learn that a channel
+	// has closed out on chain.
+	commitSetKey = []byte("commit-set")
 )
 
 var (
@@ -276,12 +289,17 @@ var (
 	// errNoActions is retuned when the log doesn't contain any stored
 	// chain actions.
 	errNoActions = fmt.Errorf("no chain actions exist")
+
+	// errNoCommitSet is return when the log doesn't contained a CommitSet.
+	// This can happen if the channel hasn't closed yet, or a client is
+	// running an older version that didn't yet write this state.
+	errNoCommitSet = fmt.Errorf("no commit set exists")
 )
 
 // boltArbitratorLog is an implementation of the ArbitratorLog interface backed
 // by a bolt DB instance.
 type boltArbitratorLog struct {
-	db *bolt.DB
+	db *bbolt.DB
 
 	cfg ChannelArbitratorConfig
 
@@ -290,7 +308,7 @@ type boltArbitratorLog struct {
 
 // newBoltArbitratorLog returns a new instance of the boltArbitratorLog given
 // an arbitrator config, and the items needed to create its log scope.
-func newBoltArbitratorLog(db *bolt.DB, cfg ChannelArbitratorConfig,
+func newBoltArbitratorLog(db *bbolt.DB, cfg ChannelArbitratorConfig,
 	chainHash chainhash.Hash, chanPoint wire.OutPoint) (*boltArbitratorLog, error) {
 
 	scope, err := newLogScope(chainHash, chanPoint)
@@ -309,7 +327,7 @@ func newBoltArbitratorLog(db *bolt.DB, cfg ChannelArbitratorConfig,
 // interface.
 var _ ArbitratorLog = (*boltArbitratorLog)(nil)
 
-func fetchContractReadBucket(tx *bolt.Tx, scopeKey []byte) (*bolt.Bucket, error) {
+func fetchContractReadBucket(tx *bbolt.Tx, scopeKey []byte) (*bbolt.Bucket, error) {
 	scopeBucket := tx.Bucket(scopeKey)
 	if scopeBucket == nil {
 		return nil, errScopeBucketNoExist
@@ -323,7 +341,7 @@ func fetchContractReadBucket(tx *bolt.Tx, scopeKey []byte) (*bolt.Bucket, error)
 	return contractBucket, nil
 }
 
-func fetchContractWriteBucket(tx *bolt.Tx, scopeKey []byte) (*bolt.Bucket, error) {
+func fetchContractWriteBucket(tx *bbolt.Tx, scopeKey []byte) (*bbolt.Bucket, error) {
 	scopeBucket, err := tx.CreateBucketIfNotExists(scopeKey)
 	if err != nil {
 		return nil, err
@@ -341,7 +359,7 @@ func fetchContractWriteBucket(tx *bolt.Tx, scopeKey []byte) (*bolt.Bucket, error
 
 // writeResolver is a helper method that writes a contract resolver and stores
 // it it within the passed contractBucket using its unique resolutionsKey key.
-func (b *boltArbitratorLog) writeResolver(contractBucket *bolt.Bucket,
+func (b *boltArbitratorLog) writeResolver(contractBucket *bbolt.Bucket,
 	res ContractResolver) error {
 
 	// First, we'll write to the buffer the type of this resolver. Using
@@ -382,7 +400,7 @@ func (b *boltArbitratorLog) writeResolver(contractBucket *bolt.Bucket,
 // NOTE: Part of the ContractResolver interface.
 func (b *boltArbitratorLog) CurrentState() (ArbitratorState, error) {
 	var s ArbitratorState
-	err := b.db.View(func(tx *bolt.Tx) error {
+	err := b.db.View(func(tx *bbolt.Tx) error {
 		scopeBucket := tx.Bucket(b.scopeKey[:])
 		if scopeBucket == nil {
 			return errScopeBucketNoExist
@@ -407,7 +425,7 @@ func (b *boltArbitratorLog) CurrentState() (ArbitratorState, error) {
 //
 // NOTE: Part of the ContractResolver interface.
 func (b *boltArbitratorLog) CommitState(s ArbitratorState) error {
-	return b.db.Batch(func(tx *bolt.Tx) error {
+	return b.db.Batch(func(tx *bbolt.Tx) error {
 		scopeBucket, err := tx.CreateBucketIfNotExists(b.scopeKey[:])
 		if err != nil {
 			return err
@@ -427,7 +445,7 @@ func (b *boltArbitratorLog) FetchUnresolvedContracts() ([]ContractResolver, erro
 		Checkpoint:              b.checkpointContract,
 	}
 	var contracts []ContractResolver
-	err := b.db.View(func(tx *bolt.Tx) error {
+	err := b.db.View(func(tx *bbolt.Tx) error {
 		contractBucket, err := fetchContractReadBucket(tx, b.scopeKey[:])
 		if err != nil {
 			return err
@@ -518,7 +536,7 @@ func (b *boltArbitratorLog) FetchUnresolvedContracts() ([]ContractResolver, erro
 //
 // NOTE: Part of the ContractResolver interface.
 func (b *boltArbitratorLog) InsertUnresolvedContracts(resolvers ...ContractResolver) error {
-	return b.db.Batch(func(tx *bolt.Tx) error {
+	return b.db.Batch(func(tx *bbolt.Tx) error {
 		contractBucket, err := fetchContractWriteBucket(tx, b.scopeKey[:])
 		if err != nil {
 			return err
@@ -541,7 +559,7 @@ func (b *boltArbitratorLog) InsertUnresolvedContracts(resolvers ...ContractResol
 //
 // NOTE: Part of the ContractResolver interface.
 func (b *boltArbitratorLog) SwapContract(oldContract, newContract ContractResolver) error {
-	return b.db.Batch(func(tx *bolt.Tx) error {
+	return b.db.Batch(func(tx *bbolt.Tx) error {
 		contractBucket, err := fetchContractWriteBucket(tx, b.scopeKey[:])
 		if err != nil {
 			return err
@@ -561,7 +579,7 @@ func (b *boltArbitratorLog) SwapContract(oldContract, newContract ContractResolv
 //
 // NOTE: Part of the ContractResolver interface.
 func (b *boltArbitratorLog) ResolveContract(res ContractResolver) error {
-	return b.db.Batch(func(tx *bolt.Tx) error {
+	return b.db.Batch(func(tx *bbolt.Tx) error {
 		contractBucket, err := fetchContractWriteBucket(tx, b.scopeKey[:])
 		if err != nil {
 			return err
@@ -579,7 +597,7 @@ func (b *boltArbitratorLog) ResolveContract(res ContractResolver) error {
 //
 // NOTE: Part of the ContractResolver interface.
 func (b *boltArbitratorLog) LogContractResolutions(c *ContractResolutions) error {
-	return b.db.Batch(func(tx *bolt.Tx) error {
+	return b.db.Batch(func(tx *bbolt.Tx) error {
 		scopeBucket, err := tx.CreateBucketIfNotExists(b.scopeKey[:])
 		if err != nil {
 			return err
@@ -640,7 +658,7 @@ func (b *boltArbitratorLog) LogContractResolutions(c *ContractResolutions) error
 // NOTE: Part of the ContractResolver interface.
 func (b *boltArbitratorLog) FetchContractResolutions() (*ContractResolutions, error) {
 	c := &ContractResolutions{}
-	err := b.db.View(func(tx *bolt.Tx) error {
+	err := b.db.View(func(tx *bbolt.Tx) error {
 		scopeBucket := tx.Bucket(b.scopeKey[:])
 		if scopeBucket == nil {
 			return errScopeBucketNoExist
@@ -719,44 +737,6 @@ func (b *boltArbitratorLog) FetchContractResolutions() (*ContractResolutions, er
 	return c, err
 }
 
-// LogChainActions stores a set of chain actions which are derived from our set
-// of active contracts, and the on-chain state. We'll write this et of cations
-// when: we decide to go on-chain to resolve a contract, or we detect that the
-// remote party has gone on-chain.
-//
-// NOTE: Part of the ContractResolver interface.
-func (b *boltArbitratorLog) LogChainActions(actions ChainActionMap) error {
-	return b.db.Batch(func(tx *bolt.Tx) error {
-		scopeBucket, err := tx.CreateBucketIfNotExists(b.scopeKey[:])
-		if err != nil {
-			return err
-		}
-
-		actionsBucket, err := scopeBucket.CreateBucketIfNotExists(
-			actionsBucketKey,
-		)
-		if err != nil {
-			return err
-		}
-
-		for chainAction, htlcs := range actions {
-			var htlcBuf bytes.Buffer
-			err := channeldb.SerializeHtlcs(&htlcBuf, htlcs...)
-			if err != nil {
-				return err
-			}
-
-			actionKey := []byte{byte(chainAction)}
-			err = actionsBucket.Put(actionKey, htlcBuf.Bytes())
-			if err != nil {
-				return err
-			}
-		}
-
-		return nil
-	})
-}
-
 // FetchChainActions attempts to fetch the set of previously stored chain
 // actions. We'll use this upon restart to properly advance our state machine
 // forward.
@@ -765,7 +745,7 @@ func (b *boltArbitratorLog) LogChainActions(actions ChainActionMap) error {
 func (b *boltArbitratorLog) FetchChainActions() (ChainActionMap, error) {
 	actionsMap := make(ChainActionMap)
 
-	err := b.db.View(func(tx *bolt.Tx) error {
+	err := b.db.View(func(tx *bbolt.Tx) error {
 		scopeBucket := tx.Bucket(b.scopeKey[:])
 		if scopeBucket == nil {
 			return errScopeBucketNoExist
@@ -801,13 +781,66 @@ func (b *boltArbitratorLog) FetchChainActions() (ChainActionMap, error) {
 	return actionsMap, nil
 }
 
+// InsertConfirmedCommitSet stores the known set of active HTLCs at the time
+// channel closure. We'll use this to reconstruct our set of chain actions anew
+// based on the confirmed and pending commitment state.
+//
+// NOTE: Part of the ContractResolver interface.
+func (b *boltArbitratorLog) InsertConfirmedCommitSet(c *CommitSet) error {
+	return b.db.Update(func(tx *bbolt.Tx) error {
+		scopeBucket, err := tx.CreateBucketIfNotExists(b.scopeKey[:])
+		if err != nil {
+			return err
+		}
+
+		var b bytes.Buffer
+		if err := encodeCommitSet(&b, c); err != nil {
+			return err
+		}
+
+		return scopeBucket.Put(commitSetKey, b.Bytes())
+	})
+}
+
+// FetchConfirmedCommitSet fetches the known confirmed active HTLC set from the
+// database.
+//
+// NOTE: Part of the ContractResolver interface.
+func (b *boltArbitratorLog) FetchConfirmedCommitSet() (*CommitSet, error) {
+	var c *CommitSet
+	err := b.db.View(func(tx *bbolt.Tx) error {
+		scopeBucket := tx.Bucket(b.scopeKey[:])
+		if scopeBucket == nil {
+			return errScopeBucketNoExist
+		}
+
+		commitSetBytes := scopeBucket.Get(commitSetKey)
+		if commitSetBytes == nil {
+			return errNoCommitSet
+		}
+
+		commitSet, err := decodeCommitSet(bytes.NewReader(commitSetBytes))
+		if err != nil {
+			return err
+		}
+
+		c = commitSet
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return c, nil
+}
+
 // WipeHistory is to be called ONLY once *all* contracts have been fully
 // resolved, and the channel closure if finalized. This method will delete all
 // on-disk state within the persistent log.
 //
 // NOTE: Part of the ContractResolver interface.
 func (b *boltArbitratorLog) WipeHistory() error {
-	return b.db.Update(func(tx *bolt.Tx) error {
+	return b.db.Update(func(tx *bbolt.Tx) error {
 		scopeBucket, err := tx.CreateBucketIfNotExists(b.scopeKey[:])
 		if err != nil {
 			return err
@@ -820,21 +853,9 @@ func (b *boltArbitratorLog) WipeHistory() error {
 		}
 
 		// Next, we'll delete any lingering contract state within the
-		// contracts bucket, and the bucket itself once we're done
-		// clearing it out.
-		contractBucket, err := scopeBucket.CreateBucketIfNotExists(
-			contractsBucketKey,
-		)
-		if err != nil {
-			return err
-		}
-		if err := contractBucket.ForEach(func(resKey, _ []byte) error {
-			return contractBucket.Delete(resKey)
-		}); err != nil {
-			return err
-		}
-		if err := scopeBucket.DeleteBucket(contractsBucketKey); err != nil {
-			fmt.Println("nah")
+		// contracts bucket by removing the bucket itself.
+		err = scopeBucket.DeleteBucket(contractsBucketKey)
+		if err != nil && err != bbolt.ErrBucketNotFound {
 			return err
 		}
 
@@ -844,20 +865,10 @@ func (b *boltArbitratorLog) WipeHistory() error {
 			return err
 		}
 
-		// Before we delta the enclosing bucket itself, we'll delta any
-		// chain actions that are still stored.
-		actionsBucket, err := scopeBucket.CreateBucketIfNotExists(
-			actionsBucketKey,
-		)
-		if err != nil {
-			return err
-		}
-		if err := actionsBucket.ForEach(func(resKey, _ []byte) error {
-			return actionsBucket.Delete(resKey)
-		}); err != nil {
-			return err
-		}
-		if err := scopeBucket.DeleteBucket(actionsBucketKey); err != nil {
+		// We'll delete any chain actions that are still stored by
+		// removing the enclosing bucket.
+		err = scopeBucket.DeleteBucket(actionsBucketKey)
+		if err != nil && err != bbolt.ErrBucketNotFound {
 			return err
 		}
 
@@ -870,7 +881,7 @@ func (b *boltArbitratorLog) WipeHistory() error {
 // ContractResolver instances to checkpoint their state once they reach
 // milestones during contract resolution.
 func (b *boltArbitratorLog) checkpointContract(c ContractResolver) error {
-	return b.db.Batch(func(tx *bolt.Tx) error {
+	return b.db.Batch(func(tx *bbolt.Tx) error {
 		contractBucket, err := fetchContractWriteBucket(tx, b.scopeKey[:])
 		if err != nil {
 			return err
@@ -908,7 +919,7 @@ func encodeIncomingResolution(w io.Writer, i *lnwallet.IncomingHtlcResolution) e
 	if err := binary.Write(w, endian, i.ClaimOutpoint.Index); err != nil {
 		return err
 	}
-	err := lnwallet.WriteSignDescriptor(w, &i.SweepSignDesc)
+	err := input.WriteSignDescriptor(w, &i.SweepSignDesc)
 	if err != nil {
 		return err
 	}
@@ -945,7 +956,7 @@ func decodeIncomingResolution(r io.Reader, h *lnwallet.IncomingHtlcResolution) e
 		return err
 	}
 
-	return lnwallet.ReadSignDescriptor(r, &h.SweepSignDesc)
+	return input.ReadSignDescriptor(r, &h.SweepSignDesc)
 }
 
 func encodeOutgoingResolution(w io.Writer, o *lnwallet.OutgoingHtlcResolution) error {
@@ -977,7 +988,7 @@ func encodeOutgoingResolution(w io.Writer, o *lnwallet.OutgoingHtlcResolution) e
 		return err
 	}
 
-	return lnwallet.WriteSignDescriptor(w, &o.SweepSignDesc)
+	return input.WriteSignDescriptor(w, &o.SweepSignDesc)
 }
 
 func decodeOutgoingResolution(r io.Reader, o *lnwallet.OutgoingHtlcResolution) error {
@@ -1010,7 +1021,7 @@ func decodeOutgoingResolution(r io.Reader, o *lnwallet.OutgoingHtlcResolution) e
 		return err
 	}
 
-	return lnwallet.ReadSignDescriptor(r, &o.SweepSignDesc)
+	return input.ReadSignDescriptor(r, &o.SweepSignDesc)
 }
 
 func encodeCommitResolution(w io.Writer,
@@ -1024,7 +1035,7 @@ func encodeCommitResolution(w io.Writer,
 		return err
 	}
 
-	err = lnwallet.WriteSignDescriptor(w, &c.SelfOutputSignDesc)
+	err = input.WriteSignDescriptor(w, &c.SelfOutputSignDesc)
 	if err != nil {
 		return err
 	}
@@ -1044,10 +1055,83 @@ func decodeCommitResolution(r io.Reader,
 		return err
 	}
 
-	err = lnwallet.ReadSignDescriptor(r, &c.SelfOutputSignDesc)
+	err = input.ReadSignDescriptor(r, &c.SelfOutputSignDesc)
 	if err != nil {
 		return err
 	}
 
 	return binary.Read(r, endian, &c.MaturityDelay)
+}
+
+func encodeHtlcSetKey(w io.Writer, h *HtlcSetKey) error {
+	err := binary.Write(w, endian, h.IsRemote)
+	if err != nil {
+		return err
+	}
+	return binary.Write(w, endian, h.IsPending)
+}
+
+func encodeCommitSet(w io.Writer, c *CommitSet) error {
+	if err := encodeHtlcSetKey(w, c.ConfCommitKey); err != nil {
+		return err
+	}
+
+	numSets := uint8(len(c.HtlcSets))
+	if err := binary.Write(w, endian, numSets); err != nil {
+		return err
+	}
+
+	for htlcSetKey, htlcs := range c.HtlcSets {
+		htlcSetKey := htlcSetKey
+		if err := encodeHtlcSetKey(w, &htlcSetKey); err != nil {
+			return err
+		}
+
+		if err := channeldb.SerializeHtlcs(w, htlcs...); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func decodeHtlcSetKey(r io.Reader, h *HtlcSetKey) error {
+	err := binary.Read(r, endian, &h.IsRemote)
+	if err != nil {
+		return err
+	}
+
+	return binary.Read(r, endian, &h.IsPending)
+}
+
+func decodeCommitSet(r io.Reader) (*CommitSet, error) {
+	c := &CommitSet{
+		ConfCommitKey: &HtlcSetKey{},
+		HtlcSets:      make(map[HtlcSetKey][]channeldb.HTLC),
+	}
+
+	if err := decodeHtlcSetKey(r, c.ConfCommitKey); err != nil {
+		return nil, err
+	}
+
+	var numSets uint8
+	if err := binary.Read(r, endian, &numSets); err != nil {
+		return nil, err
+	}
+
+	for i := uint8(0); i < numSets; i++ {
+		var htlcSetKey HtlcSetKey
+		if err := decodeHtlcSetKey(r, &htlcSetKey); err != nil {
+			return nil, err
+		}
+
+		htlcs, err := channeldb.DeserializeHtlcs(r)
+		if err != nil {
+			return nil, err
+		}
+
+		c.HtlcSets[htlcSetKey] = htlcs
+	}
+
+	return c, nil
 }

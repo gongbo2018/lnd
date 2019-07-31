@@ -1,13 +1,71 @@
 package chainntnfs
 
 import (
+	"bytes"
+	"encoding/hex"
+	"errors"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/btcsuite/btcd/btcjson"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
 )
+
+var (
+	// ErrChainNotifierShuttingDown is used when we are trying to
+	// measure a spend notification when notifier is already stopped.
+	ErrChainNotifierShuttingDown = errors.New("chain notifier shutting down")
+)
+
+// TxConfStatus denotes the status of a transaction's lookup.
+type TxConfStatus uint8
+
+const (
+	// TxFoundMempool denotes that the transaction was found within the
+	// backend node's mempool.
+	TxFoundMempool TxConfStatus = iota
+
+	// TxFoundIndex denotes that the transaction was found within the
+	// backend node's txindex.
+	TxFoundIndex
+
+	// TxNotFoundIndex denotes that the transaction was not found within the
+	// backend node's txindex.
+	TxNotFoundIndex
+
+	// TxFoundManually denotes that the transaction was found within the
+	// chain by scanning for it manually.
+	TxFoundManually
+
+	// TxNotFoundManually denotes that the transaction was not found within
+	// the chain by scanning for it manually.
+	TxNotFoundManually
+)
+
+// String returns the string representation of the TxConfStatus.
+func (t TxConfStatus) String() string {
+	switch t {
+	case TxFoundMempool:
+		return "TxFoundMempool"
+
+	case TxFoundIndex:
+		return "TxFoundIndex"
+
+	case TxNotFoundIndex:
+		return "TxNotFoundIndex"
+
+	case TxFoundManually:
+		return "TxFoundManually"
+
+	case TxNotFoundManually:
+		return "TxNotFoundManually"
+
+	default:
+		return "unknown"
+	}
+}
 
 // ChainNotifier represents a trusted source to receive notifications concerning
 // targeted events on the Bitcoin blockchain. The interface specification is
@@ -17,36 +75,44 @@ import (
 //
 // Concrete implementations of ChainNotifier should be able to support multiple
 // concurrent client requests, as well as multiple concurrent notification events.
-// TODO(roasbeef): all events should have a Cancel() method to free up the
-// resource
 type ChainNotifier interface {
 	// RegisterConfirmationsNtfn registers an intent to be notified once
 	// txid reaches numConfs confirmations. We also pass in the pkScript as
-	// the default light client instead needs to match on scripts created
-	// in the block. The returned ConfirmationEvent should properly notify
-	// the client once the specified number of confirmations has been
-	// reached for the txid, as well as if the original tx gets re-org'd
-	// out of the mainchain.  The heightHint parameter is provided as a
-	// convenience to light clients. The heightHint denotes the earliest
-	// height in the blockchain in which the target txid _could_ have been
-	// included in the chain.  This can be used to bound the search space
-	// when checking to see if a notification can immediately be dispatched
-	// due to historical data.
+	// the default light client instead needs to match on scripts created in
+	// the block. If a nil txid is passed in, then not only should we match
+	// on the script, but we should also dispatch once the transaction
+	// containing the script reaches numConfs confirmations. This can be
+	// useful in instances where we only know the script in advance, but not
+	// the transaction containing it.
+	//
+	// The returned ConfirmationEvent should properly notify the client once
+	// the specified number of confirmations has been reached for the txid,
+	// as well as if the original tx gets re-org'd out of the mainchain. The
+	// heightHint parameter is provided as a convenience to light clients.
+	// It heightHint denotes the earliest height in the blockchain in which
+	// the target txid _could_ have been included in the chain. This can be
+	// used to bound the search space when checking to see if a notification
+	// can immediately be dispatched due to historical data.
 	//
 	// NOTE: Dispatching notifications to multiple clients subscribed to
 	// the same (txid, numConfs) tuple MUST be supported.
-	RegisterConfirmationsNtfn(txid *chainhash.Hash, pkScript []byte, numConfs,
-		heightHint uint32) (*ConfirmationEvent, error)
+	RegisterConfirmationsNtfn(txid *chainhash.Hash, pkScript []byte,
+		numConfs, heightHint uint32) (*ConfirmationEvent, error)
 
 	// RegisterSpendNtfn registers an intent to be notified once the target
 	// outpoint is successfully spent within a transaction. The script that
 	// the outpoint creates must also be specified. This allows this
-	// interface to be implemented by BIP 158-like filtering. The returned
-	// SpendEvent will receive a send on the 'Spend' transaction once a
-	// transaction spending the input is detected on the blockchain.  The
-	// heightHint parameter is provided as a convenience to light clients.
-	// The heightHint denotes the earliest height in the blockchain in
-	// which the target output could have been created.
+	// interface to be implemented by BIP 158-like filtering. If a nil
+	// outpoint is passed in, then not only should we match on the script,
+	// but we should also dispatch once a transaction spends the output
+	// containing said script. This can be useful in instances where we only
+	// know the script in advance, but not the outpoint itself.
+	//
+	// The returned SpendEvent will receive a send on the 'Spend'
+	// transaction once a transaction spending the input is detected on the
+	// blockchain. The heightHint parameter is provided as a convenience to
+	// light clients. It denotes the earliest height in the blockchain in
+	// which the target output could have been spent.
 	//
 	// NOTE: The notification should only be triggered when the spending
 	// transaction receives a single confirmation.
@@ -64,7 +130,9 @@ type ChainNotifier interface {
 	// Clients have the option of passing in their best known block.
 	// If they specify a block, the ChainNotifier checks whether the client
 	// is behind on blocks. If they are, the ChainNotifier sends a backlog
-	// of block notifications for the missed blocks.
+	// of block notifications for the missed blocks. If they do not provide
+	// one, then a notification will be dispatched immediately for the
+	// current tip of the chain upon a successful registration.
 	RegisterBlockEpochNtfn(*BlockEpoch) (*BlockEpochEvent, error)
 
 	// Start the ChainNotifier. Once started, the implementation should be
@@ -92,6 +160,9 @@ type TxConfirmation struct {
 	// TxIndex is the index within the block of the ultimate confirmed
 	// transaction.
 	TxIndex uint32
+
+	// Tx is the transaction for which the notification was requested for.
+	Tx *wire.MsgTx
 }
 
 // ConfirmationEvent encapsulates a confirmation notification. With this struct,
@@ -107,23 +178,54 @@ type TxConfirmation struct {
 // If the event that the original transaction becomes re-org'd out of the main
 // chain, the 'NegativeConf' will be sent upon with a value representing the
 // depth of the re-org.
+//
+// NOTE: If the caller wishes to cancel their registered spend notification,
+// the Cancel closure MUST be called.
 type ConfirmationEvent struct {
 	// Confirmed is a channel that will be sent upon once the transaction
 	// has been fully confirmed. The struct sent will contain all the
 	// details of the channel's confirmation.
-	Confirmed chan *TxConfirmation // MUST be buffered.
+	//
+	// NOTE: This channel must be buffered.
+	Confirmed chan *TxConfirmation
 
 	// Updates is a channel that will sent upon, at every incremental
 	// confirmation, how many confirmations are left to declare the
 	// transaction as fully confirmed.
-	Updates chan uint32 // MUST be buffered.
+	//
+	// NOTE: This channel must be buffered with the number of required
+	// confirmations.
+	Updates chan uint32
 
-	// TODO(roasbeef): all goroutines on ln channel updates should also
-	// have a struct chan that's closed if funding gets re-org out. Need
-	// to sync, to request another confirmation event ntfn, then re-open
-	// channel after confs.
+	// NegativeConf is a channel that will be sent upon if the transaction
+	// confirms, but is later reorged out of the chain. The integer sent
+	// through the channel represents the reorg depth.
+	//
+	// NOTE: This channel must be buffered.
+	NegativeConf chan int32
 
-	NegativeConf chan int32 // MUST be buffered.
+	// Done is a channel that gets sent upon once the confirmation request
+	// is no longer under the risk of being reorged out of the chain.
+	//
+	// NOTE: This channel must be buffered.
+	Done chan struct{}
+
+	// Cancel is a closure that should be executed by the caller in the case
+	// that they wish to prematurely abandon their registered confirmation
+	// notification.
+	Cancel func()
+}
+
+// NewConfirmationEvent constructs a new ConfirmationEvent with newly opened
+// channels.
+func NewConfirmationEvent(numConfs uint32, cancel func()) *ConfirmationEvent {
+	return &ConfirmationEvent{
+		Confirmed:    make(chan *TxConfirmation, 1),
+		Updates:      make(chan uint32, numConfs),
+		NegativeConf: make(chan int32, 1),
+		Done:         make(chan struct{}, 1),
+		Cancel:       cancel,
+	}
 }
 
 // SpendDetail contains details pertaining to a spent output. This struct itself
@@ -148,12 +250,37 @@ type SpendDetail struct {
 type SpendEvent struct {
 	// Spend is a receive only channel which will be sent upon once the
 	// target outpoint has been spent.
-	Spend <-chan *SpendDetail // MUST be buffered.
+	//
+	// NOTE: This channel must be buffered.
+	Spend chan *SpendDetail
 
-	// Cancel is a closure that should be executed by the caller in the
-	// case that they wish to prematurely abandon their registered spend
+	// Reorg is a channel that will be sent upon once we detect the spending
+	// transaction of the outpoint in question has been reorged out of the
+	// chain.
+	//
+	// NOTE: This channel must be buffered.
+	Reorg chan struct{}
+
+	// Done is a channel that gets sent upon once the confirmation request
+	// is no longer under the risk of being reorged out of the chain.
+	//
+	// NOTE: This channel must be buffered.
+	Done chan struct{}
+
+	// Cancel is a closure that should be executed by the caller in the case
+	// that they wish to prematurely abandon their registered spend
 	// notification.
 	Cancel func()
+}
+
+// NewSpendEvent constructs a new SpendEvent with newly opened channels.
+func NewSpendEvent(cancel func()) *SpendEvent {
+	return &SpendEvent{
+		Spend:  make(chan *SpendDetail, 1),
+		Reorg:  make(chan struct{}, 1),
+		Done:   make(chan struct{}, 1),
+		Cancel: cancel,
+	}
 }
 
 // BlockEpoch represents metadata concerning each new block connected to the
@@ -177,10 +304,12 @@ type BlockEpoch struct {
 type BlockEpochEvent struct {
 	// Epochs is a receive only channel that will be sent upon each time a
 	// new block is connected to the end of the main chain.
-	Epochs <-chan *BlockEpoch // MUST be buffered.
+	//
+	// NOTE: This channel must be buffered.
+	Epochs <-chan *BlockEpoch
 
-	// Cancel is a closure that should be executed by the caller in the
-	// case that they wish to abandon their registered spend notification.
+	// Cancel is a closure that should be executed by the caller in the case
+	// that they wish to abandon their registered block epochs notification.
 	Cancel func()
 }
 
@@ -344,10 +473,10 @@ func GetClientMissedBlocks(chainConn ChainConn, clientBestBlock *BlockEpoch,
 	return missedBlocks, nil
 }
 
-// RewindChain handles internal state updates for the notifier's TxConfNotifier
-// It has no effect if given a height greater than or equal to our current best
+// RewindChain handles internal state updates for the notifier's TxNotifier It
+// has no effect if given a height greater than or equal to our current best
 // known height. It returns the new best block for the notifier.
-func RewindChain(chainConn ChainConn, txConfNotifier *TxConfNotifier,
+func RewindChain(chainConn ChainConn, txNotifier *TxNotifier,
 	currBestBlock BlockEpoch, targetHeight int32) (BlockEpoch, error) {
 
 	newBestBlock := BlockEpoch{
@@ -366,7 +495,7 @@ func RewindChain(chainConn ChainConn, txConfNotifier *TxConfNotifier,
 		Log.Infof("Block disconnected from main chain: "+
 			"height=%v, sha=%v", height, newBestBlock.Hash)
 
-		err = txConfNotifier.DisconnectTip(uint32(height))
+		err = txNotifier.DisconnectTip(uint32(height))
 		if err != nil {
 			return newBestBlock, fmt.Errorf("unable to "+
 				" disconnect tip for height=%d: %v",
@@ -388,7 +517,7 @@ func RewindChain(chainConn ChainConn, txConfNotifier *TxConfNotifier,
 // returned in case a chain rewind occurs and partially completes before
 // erroring. In the case where there is no rewind, the notifier's
 // current best block is returned.
-func HandleMissedBlocks(chainConn ChainConn, txConfNotifier *TxConfNotifier,
+func HandleMissedBlocks(chainConn ChainConn, txNotifier *TxNotifier,
 	currBestBlock BlockEpoch, newHeight int32,
 	backendStoresReorgs bool) (BlockEpoch, []BlockEpoch, error) {
 
@@ -414,7 +543,7 @@ func HandleMissedBlocks(chainConn ChainConn, txConfNotifier *TxConfNotifier,
 				"common ancestor: %v", err)
 		}
 
-		currBestBlock, err = RewindChain(chainConn, txConfNotifier,
+		currBestBlock, err = RewindChain(chainConn, txNotifier,
 			currBestBlock, startingHeight)
 		if err != nil {
 			return currBestBlock, nil, fmt.Errorf("unable to "+
@@ -456,4 +585,112 @@ func getMissedBlocks(chainConn ChainConn, startingHeight,
 	}
 
 	return missedBlocks, nil
+}
+
+// TxIndexConn abstracts an RPC backend with txindex enabled.
+type TxIndexConn interface {
+	// GetRawTransactionVerbose returns the transaction identified by the
+	// passed chain hash, and returns additional information such as the
+	// block that the transaction confirmed.
+	GetRawTransactionVerbose(*chainhash.Hash) (*btcjson.TxRawResult, error)
+
+	// GetBlockVerbose returns the block identified by the chain hash along
+	// with additional information such as the block's height in the chain.
+	GetBlockVerbose(*chainhash.Hash) (*btcjson.GetBlockVerboseResult, error)
+}
+
+// ConfDetailsFromTxIndex looks up whether a transaction is already included in
+// a block in the active chain by using the backend node's transaction index.
+// If the transaction is found its TxConfStatus is returned. If it was found in
+// the mempool this will be TxFoundMempool, if it is found in a block this will
+// be TxFoundIndex. Otherwise TxNotFoundIndex is returned. If the tx is found
+// in a block its confirmation details are also returned.
+func ConfDetailsFromTxIndex(chainConn TxIndexConn, r ConfRequest,
+	txNotFoundErr string) (*TxConfirmation, TxConfStatus, error) {
+
+	// If the transaction has some or all of its confirmations required,
+	// then we may be able to dispatch it immediately.
+	rawTxRes, err := chainConn.GetRawTransactionVerbose(&r.TxID)
+	if err != nil {
+		// If the transaction lookup was successful, but it wasn't found
+		// within the index itself, then we can exit early. We'll also
+		// need to look at the error message returned as the error code
+		// is used for multiple errors.
+		jsonErr, ok := err.(*btcjson.RPCError)
+		if ok && jsonErr.Code == btcjson.ErrRPCNoTxInfo &&
+			strings.Contains(jsonErr.Message, txNotFoundErr) {
+
+			return nil, TxNotFoundIndex, nil
+		}
+
+		return nil, TxNotFoundIndex,
+			fmt.Errorf("unable to query for txid %v: %v",
+				r.TxID, err)
+	}
+
+	// Deserialize the hex-encoded transaction to include it in the
+	// confirmation details.
+	rawTx, err := hex.DecodeString(rawTxRes.Hex)
+	if err != nil {
+		return nil, TxNotFoundIndex,
+			fmt.Errorf("unable to deserialize tx %v: %v",
+				r.TxID, err)
+	}
+	var tx wire.MsgTx
+	if err := tx.Deserialize(bytes.NewReader(rawTx)); err != nil {
+		return nil, TxNotFoundIndex,
+			fmt.Errorf("unable to deserialize tx %v: %v",
+				r.TxID, err)
+	}
+
+	// Ensure the transaction matches our confirmation request in terms of
+	// txid and pkscript.
+	if !r.MatchesTx(&tx) {
+		return nil, TxNotFoundIndex,
+			fmt.Errorf("unable to locate tx %v", r.TxID)
+	}
+
+	// Make sure we actually retrieved a transaction that is included in a
+	// block. If not, the transaction must be unconfirmed (in the mempool),
+	// and we'll return TxFoundMempool together with a nil TxConfirmation.
+	if rawTxRes.BlockHash == "" {
+		return nil, TxFoundMempool, nil
+	}
+
+	// As we need to fully populate the returned TxConfirmation struct,
+	// grab the block in which the transaction was confirmed so we can
+	// locate its exact index within the block.
+	blockHash, err := chainhash.NewHashFromStr(rawTxRes.BlockHash)
+	if err != nil {
+		return nil, TxNotFoundIndex,
+			fmt.Errorf("unable to get block hash %v for "+
+				"historical dispatch: %v", rawTxRes.BlockHash, err)
+	}
+	block, err := chainConn.GetBlockVerbose(blockHash)
+	if err != nil {
+		return nil, TxNotFoundIndex,
+			fmt.Errorf("unable to get block with hash %v for "+
+				"historical dispatch: %v", blockHash, err)
+	}
+
+	// If the block was obtained, locate the transaction's index within the
+	// block so we can give the subscriber full confirmation details.
+	txidStr := r.TxID.String()
+	for txIndex, txHash := range block.Tx {
+		if txHash != txidStr {
+			continue
+		}
+
+		return &TxConfirmation{
+			Tx:          &tx,
+			BlockHash:   blockHash,
+			BlockHeight: uint32(block.Height),
+			TxIndex:     uint32(txIndex),
+		}, TxFoundIndex, nil
+	}
+
+	// We return an error because we should have found the transaction
+	// within the block, but didn't.
+	return nil, TxNotFoundIndex, fmt.Errorf("unable to locate "+
+		"tx %v in block %v", r.TxID, blockHash)
 }

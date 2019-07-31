@@ -1,6 +1,10 @@
 package keychain
 
-import "github.com/btcsuite/btcd/btcec"
+import (
+	"fmt"
+
+	"github.com/btcsuite/btcd/btcec"
+)
 
 const (
 	// KeyDerivationVersion is the version of the key derivation schema
@@ -20,6 +24,18 @@ const (
 	BIP0043Purpose = 1017
 )
 
+var (
+	// MaxKeyRangeScan is the maximum number of keys that we'll attempt to
+	// scan with if a caller knows the public key, but not the KeyLocator
+	// and wishes to derive a private key.
+	MaxKeyRangeScan = 100000
+
+	// ErrCannotDerivePrivKey is returned when DerivePrivKey is unable to
+	// derive a private key given only the public key and target key
+	// family.
+	ErrCannotDerivePrivKey = fmt.Errorf("unable to derive private key")
+)
+
 // KeyFamily represents a "family" of keys that will be used within various
 // contracts created by lnd. These families are meant to be distinct branches
 // within the HD key chain of the backing wallet. Usage of key families within
@@ -29,7 +45,7 @@ const (
 // The key derivation in this file follows the following hierarchy based on
 // BIP43:
 //
-//   * m/1017'/coinType'/keyFamily/0/index
+//   * m/1017'/coinType'/keyFamily'/0/index
 type KeyFamily uint32
 
 const (
@@ -67,6 +83,26 @@ const (
 	// in order to establish a transport session with us on the Lightning
 	// p2p level (BOLT-0008).
 	KeyFamilyNodeKey KeyFamily = 6
+
+	// KeyFamilyStaticBackup is the family of keys that will be used to
+	// derive keys that we use to encrypt and decrypt our set of static
+	// backups. These backups may either be stored within watch towers for
+	// a payment, or self stored on disk in a single file containing all
+	// the static channel backups.
+	KeyFamilyStaticBackup KeyFamily = 7
+
+	// KeyFamilyTowerSession is the family of keys that will be used to
+	// derive session keys when negotiating sessions with watchtowers. The
+	// session keys are limited to the lifetime of the session and are used
+	// to increase privacy in the watchtower protocol.
+	KeyFamilyTowerSession KeyFamily = 8
+
+	// KeyFamilyTowerID is the family of keys used to derive the public key
+	// of a watchtower. This made distinct from the node key to offer a form
+	// of rudimentary whitelisting, i.e. via knowledge of the pubkey,
+	// preventing others from having full access to the tower just as a
+	// result of knowing the node key.
+	KeyFamilyTowerID KeyFamily = 9
 )
 
 // KeyLocator is a two-tuple that can be used to derive *any* key that has ever
@@ -74,9 +110,9 @@ const (
 // Version 0 of our key derivation schema uses the following BIP43-like
 // derivation:
 //
-//   * m/201'/coinType'/keyFamily/0/index
+//   * m/1017'/coinType'/keyFamily'/0/index
 //
-// Our purpose is 201 (chosen arbitrary for now), and the coin type will vary
+// Our purpose is 1017 (chosen arbitrary for now), and the coin type will vary
 // based on which coin/chain the channels are being created on. The key family
 // are actually just individual "accounts" in the nomenclature of BIP43. By
 // default we assume a branch of 0 (external). Finally, the key index (which
@@ -141,7 +177,10 @@ type SecretKeyRing interface {
 	KeyRing
 
 	// DerivePrivKey attempts to derive the private key that corresponds to
-	// the passed key descriptor.
+	// the passed key descriptor.  If the public key is set, then this
+	// method will perform an in-order scan over the key set, with a max of
+	// MaxKeyRangeScan keys. In order for this to work, the caller MUST set
+	// the KeyFamily within the partially populated KeyLocator.
 	DerivePrivKey(keyDesc KeyDescriptor) (*btcec.PrivateKey, error)
 
 	// ScalarMult performs a scalar multiplication (ECDH-like operation)
